@@ -239,6 +239,17 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
 
   // Create NodeComputeInfo with session and function (transfers ownership).
   auto* info = new IreeNodeComputeInfo(*ep, std::move(session), function);
+
+  // Store output metadata for DPS buffer allocation at inference time.
+  auto graph_outputs = graph.GetOutputs();
+  info->output_metas.reserve(graph_outputs.size());
+  for (const auto& output : graph_outputs) {
+    auto tensor_info = output.TypeInfo().GetTensorTypeAndShapeInfo();
+    info->output_metas.push_back(
+        {tensor_info.GetShape(),
+         OnnxToIreeElementType(tensor_info.GetElementType())});
+  }
+
   node_compute_infos[0] = info;
 
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
@@ -314,14 +325,39 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     input_views.emplace_back(view);
   }
 
+  // Allocate output buffer views for DPS mutable parameters.
+  // All outputs are passed as mutable inputs — IREE writes results in-place.
+  std::vector<HalBufferViewPtr> output_views;
+  output_views.reserve(info->output_metas.size());
+  for (const auto& meta : info->output_metas) {
+    std::vector<iree_hal_dim_t> iree_shape(meta.shape.begin(),
+                                           meta.shape.end());
+    iree_hal_buffer_params_t buffer_params = {};
+    buffer_params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL;
+    buffer_params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT;
+
+    iree_hal_buffer_view_t* view = nullptr;
+    IREE_ORT_RETURN_IF_ERROR(iree_hal_buffer_view_allocate_buffer_copy(
+        device, allocator, iree_shape.size(), iree_shape.data(),
+        meta.iree_dtype, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, buffer_params,
+        iree_make_const_byte_span(nullptr, 0), &view));
+    output_views.emplace_back(view);
+  }
+
   // Initialize the call.
   RuntimeCall call;
   IREE_ORT_RETURN_IF_ERROR(iree_runtime_call_initialize(
       info->session_.Get(), info->function_, call.Get()));
   call.MarkInitialized();
 
-  // Push input buffer views.
+  // Push regular input buffer views.
   for (auto& view : input_views) {
+    IREE_ORT_RETURN_IF_ERROR(
+        iree_runtime_call_inputs_push_back_buffer_view(call.Get(), view.Get()));
+  }
+
+  // Push output DPS buffer views as additional inputs.
+  for (auto& view : output_views) {
     IREE_ORT_RETURN_IF_ERROR(
         iree_runtime_call_inputs_push_back_buffer_view(call.Get(), view.Get()));
   }
@@ -330,41 +366,13 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   IREE_ORT_RETURN_IF_ERROR(
       iree_runtime_call_invoke(call.Get(), IREE_RUNTIME_CALL_FLAG_RESERVED));
 
-  // Pop outputs and copy to ORT tensors.
-  //
-  // TODO(perf): Currently IREE allocates its own output buffers, then we copy
-  // to ORT's pre-allocated device buffers (D2D copy). The way to properly
-  // eliminate this is by passing mutable dps buffers as part of the iree input
-  // signature and writing to them. The problem is that ORT doesn't give us a
-  // good way to infer the output shape. I'm not sure what the right fix is.
-  // Maybe we could have a custom iree allocator that does the job for us?
-  // I'm just not sure how to do this properly.
-  iree_vm_list_t* output_list = iree_runtime_call_outputs(call.Get());
-  iree_host_size_t output_count = iree_vm_list_size(output_list);
-
-  for (size_t i = 0; i < output_count; ++i) {
-    // Pop output buffer view.
-    iree_hal_buffer_view_t* output_view = nullptr;
-    IREE_ORT_RETURN_IF_ERROR(iree_runtime_call_outputs_pop_front_buffer_view(
-        call.Get(), &output_view));
-    HalBufferViewPtr output_view_ptr(output_view);
-
-    // Get shape and element type from IREE buffer view.
-    std::vector<int64_t> shape = GetBufferViewShape(output_view);
-    iree_hal_element_type_t iree_dtype =
-        iree_hal_buffer_view_element_type(output_view);
-    ONNXTensorElementDataType onnx_dtype = IreeToOnnxElementType(iree_dtype);
-
-    if (onnx_dtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
-      return Ort::Status("IREE EP: Unsupported output element type",
-                         ORT_NOT_IMPLEMENTED)
-          .release();
-    }
-
-    // Allocate ORT output tensor and copy data from IREE buffer.
+  // Copy results from DPS output buffers to ORT tensors.
+  for (size_t i = 0; i < output_views.size(); ++i) {
+    iree_hal_buffer_view_t* view = output_views[i].Get();
+    std::vector<int64_t> shape = GetBufferViewShape(view);
     Ort::UnownedValue output = ctx.GetOutput(i, shape.data(), shape.size());
     ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(
-        output_view, output, device, info->ep.ep_api, info->ep.Logger()));
+        view, output, device, info->ep.ep_api, info->ep.Logger()));
   }
   return nullptr;
 }

@@ -20,7 +20,6 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -166,6 +165,33 @@ std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
   return ss.str();
 }
 
+// Formats a mutable tensor type as !torch.tensor<[dims],dtype>.
+// Like FormatTensorType but uses mutable `tensor` instead of `vtensor`.
+std::string FormatMutableTensorType(const Ort::ConstTypeInfo& type_info) {
+  if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
+    return "NYI";
+  }
+
+  auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+  auto shape = tensor_info.GetShape();
+  auto dtype = tensor_info.GetElementType();
+
+  std::ostringstream ss;
+  ss << "!torch.tensor<[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i > 0) {
+      ss << ",";
+    }
+    if (shape[i] < 0) {
+      ss << "?";
+    } else {
+      ss << shape[i];
+    }
+  }
+  ss << "]," << GetElementType(dtype) << ">";
+  return ss.str();
+}
+
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
 // Uses signless integer types as required by MLIR tensor dialect.
 std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
@@ -204,6 +230,11 @@ class MlirGenerator {
     EmitFunctionBody();
     EmitModuleFooter();
   }
+
+  // Returns the number of regular (non-mutable) graph inputs.
+  // The IREE function signature is: [graph_inputs..., output_mutables...].
+  // Output i maps to IREE input index (GetNumGraphInputs() + i).
+  size_t GetNumGraphInputs() const { return graph_inputs_.size(); }
 
   // Builds an IRPA parameter archive for large initializers and creates a
   // parameter provider. Call after Generate(). If no parameters are needed,
@@ -257,7 +288,7 @@ class MlirGenerator {
   }
 
   void EmitModuleHeader() {
-    // Build function arguments.
+    // Build function arguments: regular inputs + mutable output parameters.
     std::ostringstream args;
     for (size_t i = 0; i < graph_inputs_.size(); ++i) {
       if (i > 0) {
@@ -268,20 +299,22 @@ class MlirGenerator {
       args << "%" << name << ": " << type;
     }
 
-    // Build return types.
-    std::ostringstream ret_types;
+    // Append mutable output parameters for destination-passing style.
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
-      if (i > 0) {
-        ret_types << ", ";
+      if (!graph_inputs_.empty() || i > 0) {
+        args << ", ";
       }
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      std::string name = SanitizeName(graph_outputs_[i].GetName());
+      std::string type = FormatMutableTensorType(graph_outputs_[i].TypeInfo());
+      args << "%" << name << "__mutable: " << type;
     }
 
+    // All outputs are written in-place via DPS — function returns nothing.
     constexpr std::string_view schema = R"(module {{
-  func.func @{0}({1}) -> ({2})
+  func.func @{0}({1})
       attributes {{
-        torch.onnx_meta.ir_version = {3} : si64,
-        torch.onnx_meta.opset_version = {4} : si64,
+        torch.onnx_meta.ir_version = {2} : si64,
+        torch.onnx_meta.opset_version = {3} : si64,
         torch.onnx_meta.producer_name = "onnxruntime-ep-iree",
         torch.onnx_meta.producer_version = ""
       }} {{
@@ -290,9 +323,8 @@ class MlirGenerator {
     out_ << std::format(schema,
                         graph_name_,      // {0}
                         args.str(),       // {1}
-                        ret_types.str(),  // {2}
-                        ir_version_,      // {3}
-                        opset_version_);  // {4}
+                        ir_version_,      // {2}
+                        opset_version_);  // {3}
   }
 
   void EmitFunctionBody() {
@@ -487,19 +519,18 @@ class MlirGenerator {
   }
 
   void EmitReturn() {
-    std::ostringstream ret_values;
-    std::ostringstream ret_types;
+    // Write all outputs into their mutable DPS parameters.
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
-      if (i > 0) {
-        ret_values << ", ";
-        ret_types << ", ";
-      }
-      ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      std::string name = SanitizeName(graph_outputs_[i].GetName());
+      std::string vtensor_type = FormatTensorType(graph_outputs_[i].TypeInfo());
+      std::string mutable_type =
+          FormatMutableTensorType(graph_outputs_[i].TypeInfo());
+      constexpr std::string_view schema =
+          R"(    torch.overwrite.tensor.contents %{0} overwrites %{0}__mutable : {1}, {2}
+)";
+      out_ << std::format(schema, name, vtensor_type, mutable_type);
     }
-
-    out_ << std::format("    return {0} : {1}\n", ret_values.str(),
-                        ret_types.str());
+    out_ << "    return\n";
   }
 
   void EmitModuleFooter() {

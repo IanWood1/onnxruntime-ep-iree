@@ -15,7 +15,9 @@
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 
 #include <string>
+#include <vector>
 
+#include "iree/hal/api.h"
 #include "iree_ep_factory.h"
 #include "iree_wrappers.h"
 #include "ort_import.h"
@@ -119,6 +121,14 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   // IREE runtime state for this compiled subgraph.
   RuntimeSessionPtr session_;
   iree_vm_function_t function_;
+
+  // Output metadata for DPS buffer allocation at inference time.
+  // Each entry stores the shape and IREE element type for one graph output.
+  struct OutputMeta {
+    std::vector<int64_t> shape;
+    iree_hal_element_type_t iree_dtype;
+  };
+  std::vector<OutputMeta> output_metas;
 };
 
 }  // namespace onnxruntime::iree

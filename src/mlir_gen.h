@@ -35,6 +35,10 @@ namespace onnxruntime::iree {
 // parameter references and their data is written to an IRPA archive at
 // irpa_path. out_index and out_provider are populated with the parameter index
 // and provider for the archive. They remain null if no parameters are needed.
+//
+// All graph outputs are emitted as mutable DPS (destination-passing style)
+// parameters appended after regular inputs. The generated IREE function takes
+// [graph_inputs..., output_mutables...] and returns nothing.
 OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
                         const std::string& mlir_path,
                         const std::string& irpa_path,
