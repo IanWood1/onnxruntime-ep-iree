@@ -2,6 +2,7 @@
 
 import argparse
 import pathlib
+import time
 import numpy as np
 import onnxruntime as ort
 import onnxruntime_ep_iree
@@ -28,9 +29,9 @@ def print_model_info(session):
 
 def get_iree_session(model_path: str, target_arch: str = "llvm-cpu"):
     """Create an ONNX Runtime session with the IREE EP."""
-    ort.set_default_logger_severity(0)
-
     ep_lib_path = onnxruntime_ep_iree.get_library_path()
+
+    # ort.set_default_logger_severity(0)
 
     print(f"EP library path: {ep_lib_path}")
     ort.register_execution_provider_library("IREE", str(ep_lib_path))
@@ -63,7 +64,8 @@ def get_iree_session(model_path: str, target_arch: str = "llvm-cpu"):
     provider_options = {
         "target_arch": "gfx1100",
         "save_intermediates": "1",
-        "opt_level": "O0",
+        "opt_level": "O3",
+        "dim_specs": '[{"sequence_length": 1, "batch_size": 1}, {"sequence_length": "%32", "batch_size": 1}]',
     }
     sess_options.add_provider_for_devices([iree_device], provider_options)
 
@@ -117,130 +119,6 @@ def get_model_config(session):
     }
 
 
-def generate_text_simple(
-    session,
-    tokenizer,
-    prompt: str,
-    max_new_tokens: int = 20,
-    total_sequence: int = 128,
-    window: int = 16,
-    context: int = 1024,
-):
-    """
-    Standard HuggingFace ONNX model generation.
-
-    This model expects:
-    - position_ids to match input_ids size
-    - attention_mask size = past_seq_len + current_seq_len
-    """
-    config = get_model_config(session)
-    num_layers = config["num_layers"]
-    num_kv_heads = config["num_kv_heads"]
-    head_dim = config["head_dim"]
-    kv_dtype = config["kv_dtype"]
-    model_input_names = config["input_names"]
-
-    print(
-        f"Model config: {num_layers} layers, {num_kv_heads} KV heads, {head_dim} head dim"
-    )
-    print(
-        f"Model inputs: {sorted([n for n in model_input_names if not n.startswith('past')])}"
-    )
-
-    # Tokenize prompt
-    input_ids = tokenizer.encode(prompt, return_tensors="np").astype(np.int64)
-    prompt_len = input_ids.shape[1]
-    print(f"Prompt: '{prompt}' -> {prompt_len} tokens")
-
-    output_names = [out.name for out in session.get_outputs()]
-
-    # Initialize empty KV cache
-    past_seq_len = 0
-    past_key_values = {}
-    for i in range(num_layers):
-        past_key_values[f"past_key_values.{i}.key"] = np.zeros(
-            (1, num_kv_heads, past_seq_len, head_dim), dtype=kv_dtype
-        )
-        past_key_values[f"past_key_values.{i}.value"] = np.zeros(
-            (1, num_kv_heads, past_seq_len, head_dim), dtype=kv_dtype
-        )
-
-    generated_ids = input_ids.copy()
-
-    # === PREFILL PHASE ===
-    print(f"Prefill phase ({prompt_len} tokens)...")
-
-    # Build inputs based on what the model expects
-    inputs = {"input_ids": input_ids}
-
-    if "attention_mask" in model_input_names:
-        inputs["attention_mask"] = np.ones((1, prompt_len), dtype=np.int64)
-
-    if "position_ids" in model_input_names:
-        inputs["position_ids"] = np.arange(prompt_len, dtype=np.int64).reshape(1, -1)
-
-    # Add KV cache inputs that exist in the model
-    for name, value in past_key_values.items():
-        if name in model_input_names:
-            inputs[name] = value
-
-    outputs = session.run(None, inputs)
-    logits = outputs[0]
-
-    # Update KV cache from prefill outputs
-    for i, name in enumerate(output_names[1:], start=1):
-        past_name = name.replace("present.", "past_key_values.")
-        if past_name in past_key_values:
-            past_key_values[past_name] = outputs[i]
-
-    past_seq_len = past_key_values[f"past_key_values.0.key"].shape[2]
-    print(f"Prefill done, KV cache size: {past_seq_len}")
-
-    # Get first generated token
-    next_token = int(np.argmax(logits[0, -1, :]))
-    generated_ids = np.concatenate([generated_ids, [[next_token]]], axis=1)
-    print(f"First token: {next_token} = '{tokenizer.decode([next_token])}'")
-
-    # === DECODE PHASE ===
-    print("Decode phase...")
-    for step in range(max_new_tokens - 1):
-        total_len = past_seq_len + 1
-
-        # Build inputs based on what the model expects
-        inputs = {"input_ids": np.array([[next_token]], dtype=np.int64)}
-
-        if "attention_mask" in model_input_names:
-            inputs["attention_mask"] = np.ones((1, total_len), dtype=np.int64)
-
-        if "position_ids" in model_input_names:
-            inputs["position_ids"] = np.array([[past_seq_len]], dtype=np.int64)
-
-        # Add KV cache inputs
-        for name, value in past_key_values.items():
-            if name in model_input_names:
-                inputs[name] = value
-
-        outputs = session.run(None, inputs)
-        logits = outputs[0]
-
-        # Update KV cache
-        for i, name in enumerate(output_names[1:], start=1):
-            past_name = name.replace("present.", "past_key_values.")
-            if past_name in past_key_values:
-                past_key_values[past_name] = outputs[i]
-
-        past_seq_len = past_key_values[f"past_key_values.0.key"].shape[2]
-
-        next_token = int(np.argmax(logits[0, -1, :]))
-        generated_ids = np.concatenate([generated_ids, [[next_token]]], axis=1)
-
-        if next_token == tokenizer.eos_token_id:
-            print(f"EOS at step {step + 1}")
-            break
-
-    return tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-
 def generate_text_iobinding(
     session,
     iree_device,
@@ -277,12 +155,31 @@ def generate_text_iobinding(
 
     device_id = iree_device.device.device_id
 
-    # Tokenize prompt
+    # Tokenize prompt and pad to a multiple of 32 for dim spec matching.
     input_ids = tokenizer.encode(prompt, return_tensors="np").astype(np.int64)
     prompt_len = input_ids.shape[1]
-    print(f"Prompt: '{prompt}' -> {prompt_len} tokens")
+    pad_multiple = 32
+    padded_len = ((prompt_len + pad_multiple - 1) // pad_multiple) * pad_multiple
+    pad_amount = padded_len - prompt_len
+    if pad_amount > 0:
+        input_ids = np.concatenate(
+            [input_ids, np.zeros((1, pad_amount), dtype=np.int64)], axis=1
+        )
+    print(f"Prompt: '{prompt}' -> {prompt_len} tokens (padded to {padded_len})")
 
     output_names = [out.name for out in session.get_outputs()]
+
+    # Find the logits output index by name (output ordering varies by model).
+    logits_index = None
+    for idx, name in enumerate(output_names):
+        if name == "logits":
+            logits_index = idx
+            break
+    if logits_index is None:
+        raise RuntimeError(
+            f"Could not find 'logits' output. Available: {output_names[:5]}..."
+        )
+    print(f"Logits output at index {logits_index} (of {len(output_names)} outputs)")
 
     # IREE workaround: Initialize KV cache with 1 dummy position (to avoid 0-size tensors)
     # We'll mask it out with attention_mask (if the model has it)
@@ -296,27 +193,20 @@ def generate_text_iobinding(
             (1, num_kv_heads, num_dummy, head_dim), dtype=kv_dtype
         )
 
-    generated_ids = input_ids.copy()
+    generated_ids = tokenizer.encode(prompt, return_tensors="np").astype(np.int64)
 
     # === PREFILL PHASE ===
-    print(f"Prefill phase ({prompt_len} tokens)...")
+    print(f"Prefill phase ({padded_len} tokens)...")
 
     # Build inputs based on what the model expects
     inputs = {"input_ids": input_ids}
 
     if has_attention_mask:
-        # Attention mask: 0 for dummy position, 1 for real tokens
-        inputs["attention_mask"] = np.concatenate(
-            [
-                np.zeros((1, num_dummy), dtype=np.int64),
-                np.ones((1, prompt_len), dtype=np.int64),
-            ],
-            axis=1,
-        )
+        # Prefill attention mask: all 1s (dummy + padded input).
+        inputs["attention_mask"] = np.ones((1, num_dummy + padded_len), dtype=np.int64)
 
     if has_position_ids:
-        # Position IDs: 0, 1, 2, ... for the real tokens (not including dummy)
-        inputs["position_ids"] = np.arange(prompt_len, dtype=np.int64).reshape(1, -1)
+        inputs["position_ids"] = np.arange(padded_len, dtype=np.int64).reshape(1, -1)
 
     # Add KV cache inputs that exist in the model
     for name, value in past_key_values.items():
@@ -324,21 +214,32 @@ def generate_text_iobinding(
             inputs[name] = value
 
     # Run prefill
+    t0 = time.perf_counter()
     outputs = session.run(None, inputs)
-    logits = outputs[0]
+    prefill_ms = (time.perf_counter() - t0) * 1000
+    logits = outputs[logits_index]
+    print(f"Prefill: {prefill_ms:.1f} ms, logits shape: {logits.shape}")
 
-    # Get first generated token
-    next_token = int(np.argmax(logits[0, -1, :]))
+    # Get first generated token from last REAL token position (not padding).
+    next_token = int(np.argmax(logits[0, prompt_len - 1, :]))
     generated_ids = np.concatenate([generated_ids, [[next_token]]], axis=1)
     print(f"First token: {next_token} = '{tokenizer.decode([next_token])}'")
 
-    # Update KV cache and move to device
-    print("Moving KV cache to device...")
+    # Update KV cache: strip padding positions and move to device.
+    # Present KV shape: [1, heads, num_dummy + padded_len, head_dim].
+    # Keep only [0 : num_dummy + prompt_len] to remove padding KV entries.
+    keep_len = num_dummy + prompt_len
+    print(
+        f"Moving KV cache to device (keeping {keep_len} of "
+        f"{num_dummy + padded_len} positions, stripping {pad_amount} padding)..."
+    )
     kv_cache_device = {}
-    for i, name in enumerate(output_names[1:], start=1):
+    for i, name in enumerate(output_names):
+        if i == logits_index:
+            continue
         past_name = name.replace("present.", "past_key_values.")
         if "past_key_values" in past_name and past_name in model_input_names:
-            kv_data = outputs[i]
+            kv_data = outputs[i][:, :, :keep_len, :].copy()
             kv_shape = list(kv_data.shape)
 
             device_tensor = ort.OrtValue.ortvalue_from_shape_and_type(
@@ -351,12 +252,15 @@ def generate_text_iobinding(
             device_tensor.update_inplace(kv_data)
             kv_cache_device[past_name] = device_tensor
 
-    # After prefill, KV cache contains: [dummy (1)] + [prompt tokens (prompt_len)]
-    # Total KV size = num_dummy + prompt_len
-    past_seq_len = num_dummy + prompt_len
+    # Free prefill CPU outputs — no longer needed.
+    del outputs, logits, inputs
+
+    # After stripping, KV cache contains: [dummy (1)] + [real tokens (prompt_len)]
+    past_seq_len = keep_len
 
     # === DECODE PHASE WITH IO BINDING ===
     print("Decode phase with IO binding...")
+    decode_times = []
 
     for step in range(max_new_tokens - 1):
         io_binding = session.io_binding()
@@ -368,21 +272,17 @@ def generate_text_iobinding(
         io_binding.bind_ortvalue_input("input_ids", input_ids_tensor)
 
         if has_attention_mask:
-            # attention_mask: 0 for dummy, 1 for real tokens + new token
-            total_len = past_seq_len + 1
-            attention_mask = np.concatenate(
-                [
-                    np.zeros((1, num_dummy), dtype=np.int64),
-                    np.ones((1, total_len - num_dummy), dtype=np.int64),
-                ],
-                axis=1,
-            )
+            # Decode attention mask: all 1s for (past_seq_len + 1) positions.
+            # Padding was stripped from KV cache after prefill, so there are
+            # no gaps — past contains only dummy + real prompt + generated.
+            num_generated = step + 1
+            attention_mask = np.ones((1, past_seq_len + 1), dtype=np.int64)
             attn_tensor = ort.OrtValue.ortvalue_from_numpy(attention_mask)
             io_binding.bind_ortvalue_input("attention_mask", attn_tensor)
 
         if has_position_ids:
-            # position_ids: current position (real sequence length, not including dummy)
-            real_pos = past_seq_len - num_dummy  # = prompt_len + tokens_generated
+            # position_ids: real position (prompt_len + tokens generated so far)
+            real_pos = prompt_len + step
             position_ids = np.array([[real_pos]], dtype=np.int64)
             pos_tensor = ort.OrtValue.ortvalue_from_numpy(position_ids)
             io_binding.bind_ortvalue_input("position_ids", pos_tensor)
@@ -396,36 +296,58 @@ def generate_text_iobinding(
             io_binding.bind_output(name, device_type="cpu")
 
         # Run
+        t0 = time.perf_counter()
         session.run_with_iobinding(io_binding)
+        step_ms = (time.perf_counter() - t0) * 1000
+        decode_times.append(step_ms)
+        print(f"  Decode step {step}: {step_ms:.1f} ms")
         ort_outputs = io_binding.get_outputs()
 
         # Get logits
-        logits = ort_outputs[0].numpy()
+        logits = ort_outputs[logits_index].numpy()
         next_token = int(np.argmax(logits[0, -1, :]))
         generated_ids = np.concatenate([generated_ids, [[next_token]]], axis=1)
 
-        # Update KV cache on device
-        for i, name in enumerate(output_names[1:], start=1):
+        # Extract KV cache data to CPU numpy arrays before freeing GPU resources.
+        new_kv_data = {}
+        for i, name in enumerate(output_names):
+            if i == logits_index:
+                continue
             past_name = name.replace("present.", "past_key_values.")
             if past_name in kv_cache_device:
-                kv_data = ort_outputs[i].numpy()
-                kv_shape = list(kv_data.shape)
+                new_kv_data[past_name] = ort_outputs[i].numpy()
 
-                device_tensor = ort.OrtValue.ortvalue_from_shape_and_type(
-                    kv_shape,
-                    kv_dtype,
-                    device_type="gpu",
-                    device_id=device_id,
-                    vendor_id=IREE_VENDOR_ID,
-                )
-                device_tensor.update_inplace(kv_data)
-                kv_cache_device[past_name] = device_tensor
+        # Free previous step's GPU resources before allocating new ones.
+        # Delete io_binding first — it holds refs to old KV cache bound as inputs.
+        # Then pop each GPU tensor individually so refcount hits 0 immediately.
+        del ort_outputs
+        del io_binding
+        while kv_cache_device:
+            _, tensor = kv_cache_device.popitem()
+            del tensor
+
+        # Allocate new KV cache on device.
+        for past_name, kv_data in new_kv_data.items():
+            kv_shape = list(kv_data.shape)
+            device_tensor = ort.OrtValue.ortvalue_from_shape_and_type(
+                kv_shape,
+                kv_dtype,
+                device_type="gpu",
+                device_id=device_id,
+                vendor_id=IREE_VENDOR_ID,
+            )
+            device_tensor.update_inplace(kv_data)
+            kv_cache_device[past_name] = device_tensor
 
         past_seq_len += 1
 
         if next_token == tokenizer.eos_token_id:
             print(f"EOS at step {step + 1}")
             break
+
+    if decode_times:
+        avg_ms = sum(decode_times) / len(decode_times)
+        print(f"Decode avg: {avg_ms:.1f} ms/token ({len(decode_times)} steps)")
 
     return tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 
@@ -505,8 +427,8 @@ def main():
                 session, iree_device, tokenizer, args.prompt, **gen_kwargs
             )
         else:
-            generated = generate_text_simple(
-                session, tokenizer, args.prompt, **gen_kwargs
+            raise RuntimeError(
+                "Only IREE EP with IO binding is currently supported in this test."
             )
 
         print(f"\n{'='*60}")
