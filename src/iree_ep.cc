@@ -13,6 +13,12 @@
 
 #include "iree_ep.h"
 
+#include <algorithm>
+#include <format>
+#include <numeric>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "iree/modules/io/parameters/module.h"
@@ -24,6 +30,149 @@
 #include "temp_file.h"
 
 namespace onnxruntime::iree {
+
+// ============================================================================
+// JSON Parsing for dim_specs
+// ============================================================================
+
+// Simple hand-written JSON parser for dim_specs. Avoids adding a JSON library
+// dependency. Supports: [{"key": int, "key": "%N"}, ...]
+std::vector<DimSpecVariant> ParseDimSpecsJson(const std::string& json) {
+  std::vector<DimSpecVariant> variants;
+  size_t pos = 0;
+
+  auto skip_ws = [&]() {
+    while (pos < json.size() && std::isspace(json[pos])) pos++;
+  };
+
+  auto expect = [&](char c) {
+    skip_ws();
+    if (pos >= json.size() || json[pos] != c) {
+      throw std::runtime_error(
+          std::format("dim_specs JSON: expected '{}' at position {}", c, pos));
+    }
+    pos++;
+  };
+
+  auto parse_string = [&]() -> std::string {
+    skip_ws();
+    expect('"');
+    std::string result;
+    while (pos < json.size() && json[pos] != '"') {
+      if (json[pos] == '\\' && pos + 1 < json.size()) {
+        pos++;  // Skip escape character.
+      }
+      result += json[pos++];
+    }
+    expect('"');
+    return result;
+  };
+
+  skip_ws();
+  if (pos >= json.size()) return variants;
+  expect('[');
+
+  skip_ws();
+  while (pos < json.size() && json[pos] != ']') {
+    // Parse one variant object.
+    DimSpecVariant variant;
+    expect('{');
+
+    skip_ws();
+    while (pos < json.size() && json[pos] != '}') {
+      // Parse "key": value pair.
+      std::string key = parse_string();
+      skip_ws();
+      expect(':');
+      skip_ws();
+
+      if (pos < json.size() && json[pos] == '"') {
+        // String value: "%N" divisibility spec.
+        std::string val = parse_string();
+        if (val.size() >= 2 && val[0] == '%') {
+          int64_t divisor = std::stoll(val.substr(1));
+          variant.push_back({key, DimSpec::Kind::kDivisibleBy, divisor});
+        }
+      } else {
+        // Numeric value: static spec.
+        // Parse integer (possibly negative).
+        std::string num_str;
+        if (pos < json.size() && json[pos] == '-') {
+          num_str += json[pos++];
+        }
+        while (pos < json.size() && std::isdigit(json[pos])) {
+          num_str += json[pos++];
+        }
+        int64_t value = std::stoll(num_str);
+        variant.push_back({key, DimSpec::Kind::kStatic, value});
+      }
+
+      skip_ws();
+      if (pos < json.size() && json[pos] == ',') pos++;  // Skip comma.
+      skip_ws();
+    }
+    expect('}');
+
+    variants.push_back(std::move(variant));
+    skip_ws();
+    if (pos < json.size() && json[pos] == ',') pos++;  // Skip comma.
+    skip_ws();
+  }
+
+  if (pos < json.size()) expect(']');
+  return variants;
+}
+
+// Returns a specificity score for a variant. Higher = more specific.
+// Static specs count as 2, divisibility specs count as 1.
+static int VariantSpecificity(const DimSpecVariant& variant) {
+  int score = 0;
+  for (const auto& spec : variant) {
+    score += (spec.kind == DimSpec::Kind::kStatic) ? 2 : 1;
+  }
+  return score;
+}
+
+// Creates an IREE runtime session, optionally registers parameters, loads a
+// VMFB, and looks up the entry function. Returns the session and function.
+
+// Builds symbolic dimension mappings from graph inputs. This tells the runtime
+// which (input_index, dim_index) corresponds to each symbolic dimension name.
+static std::vector<IreeNodeComputeInfo::SymbolicDimMapping>
+BuildSymbolicDimMappings(const Ort::ConstGraph& graph) {
+  std::vector<IreeNodeComputeInfo::SymbolicDimMapping> mappings;
+  std::unordered_set<std::string> seen;
+
+  auto inputs = graph.GetInputs();
+  auto initializers = graph.GetInitializers();
+  std::unordered_set<std::string> init_names;
+  for (const auto& init : initializers) {
+    init_names.insert(init.GetName());
+  }
+
+  size_t input_index = 0;
+  for (const auto& input : inputs) {
+    if (init_names.count(input.GetName())) continue;
+    auto type_info = input.TypeInfo();
+    if (type_info.GetONNXType() == ONNX_TYPE_TENSOR) {
+      auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+      auto shape = tensor_info.GetShape();
+      auto sym_dims = tensor_info.GetSymbolicDimensions();
+      for (size_t d = 0; d < shape.size(); ++d) {
+        if (shape[d] < 0 && d < sym_dims.size() && sym_dims[d] != nullptr &&
+            sym_dims[d][0] != '\0') {
+          std::string name(sym_dims[d]);
+          if (!seen.count(name)) {
+            seen.insert(name);
+            mappings.push_back({input_index, d, name});
+          }
+        }
+      }
+    }
+    input_index++;
+  }
+  return mappings;
+}
 
 static std::vector<std::string> GenerateCompileFlags(
     const IreeEp::Config& config) {
@@ -146,12 +295,27 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         .release();
   }
 
-  // Create temp files for intermediate artifacts.
+  // TODO: Do we need to handle multiple graphs?
+  Ort::ConstGraph graph{graphs[0]};
+
+  // Determine how many variants we need (specialized + generic fallback).
+  const auto& dim_spec_variants = ep->config_.dim_spec_variants;
+  size_t num_specialized = dim_spec_variants.size();
+
+  // Sort specialized variants by specificity (most specific first).
+  std::vector<size_t> sorted_indices(num_specialized);
+  std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+  std::sort(sorted_indices.begin(), sorted_indices.end(),
+            [&](size_t a, size_t b) {
+              return VariantSpecificity(dim_spec_variants[a]) >
+                     VariantSpecificity(dim_spec_variants[b]);
+            });
+
+  // Create temp files: one combined MLIR, one VMFB, one IRPA.
   TempFile mlir_file(".mlir");
   TempFile vmfb_file(".vmfb");
   TempFile irpa_file(".irpa");
 
-  // If save_intermediates is enabled, mark files to be kept for debugging.
   if (ep->config_.save_intermediates) {
     mlir_file.Keep();
     vmfb_file.Keep();
@@ -167,82 +331,122 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
                           irpa_file.Path().c_str());
   }
 
-  // Phase 1: Generate MLIR from the first graph.
-  // Also builds an IRPA parameter archive for large initializers.
-  // TODO: Do we need to handle multiple graphs?
-  Ort::ConstGraph graph{graphs[0]};
+  // Phase 1: Generate MLIR.
   ParameterIndexPtr parameter_index;
   ParameterProviderPtr parameter_provider;
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Generating MLIR");
-  ORT_RETURN_IF_ERROR(GenerateMlir(graph, ep->ort_api, mlir_file.Path(),
-                                   irpa_file.Path(), parameter_index,
-                                   parameter_provider));
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: MLIR Generated Successfully");
 
-  // Phase 2: Compile MLIR to VMFB.
+  if (num_specialized == 0) {
+    // No specialization: single generic function.
+    ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                         "IREE EP: Generating MLIR (no specialization)");
+    ORT_RETURN_IF_ERROR(GenerateMlir(graph, ep->ort_api, mlir_file.Path(),
+                                     irpa_file.Path(), DimSpecVariant{},
+                                     parameter_index, parameter_provider));
+  } else {
+    // Specialized variants + generic fallback in a multi-variant module.
+    std::vector<std::pair<std::string, DimSpecVariant>> mlir_variants;
+    for (size_t i = 0; i < num_specialized; ++i) {
+      size_t variant_idx = sorted_indices[i];
+      std::string suffix = "_variant" + std::to_string(i);
+      mlir_variants.emplace_back(suffix, dim_spec_variants[variant_idx]);
+    }
+    // Generic fallback: no specialization, always matches.
+    mlir_variants.emplace_back("_generic", DimSpecVariant{});
+
+    ORT_CXX_LOGF_NOEXCEPT(
+        ep->logger_, ORT_LOGGING_LEVEL_INFO,
+        "IREE EP: Generating combined MLIR (%zu specialized + generic "
+        "fallback)",
+        num_specialized);
+    ORT_RETURN_IF_ERROR(GenerateMultiVariantMlir(
+        graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(), mlir_variants,
+        parameter_index, parameter_provider));
+  }
+
+  // Phase 2: Compile the single MLIR to one VMFB.
   std::vector<std::string> flags = GenerateCompileFlags(ep->config_);
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Generating VMFB");
+                       "IREE EP: Compiling VMFB...");
   ORT_RETURN_IF_ERROR(
       CompileToVmfb(mlir_file.Path(), vmfb_file.Path(), flags, ep->ort_api));
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: VMFB Generated Successfully");
+                       "IREE EP: VMFB compiled successfully");
 
-  // Phase 3: Create IREE runtime session.
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Creating runtime session");
-  RuntimeSessionPtr session;
-  iree_runtime_session_options_t session_opts;
-  iree_runtime_session_options_initialize(&session_opts);
-  IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_create_with_device(
-      ep->factory_.IreeInstance(), &session_opts, ep->IreeDevice(),
-      iree_runtime_instance_host_allocator(ep->factory_.IreeInstance()),
-      session.ForOutput()));
+  // Phase 3: Create session, load VMFB, lookup functions.
+  std::string graph_name = graph.GetName();
+  std::string base_name =
+      "module." + (graph_name.empty() ? std::string("main") : graph_name);
 
-  // Phase 4: Register io_parameters module if we have parameters.
-  // The session retains the module, which retains the provider, which retains
-  // the index. No need to store these separately.
-  if (parameter_provider) {
-    ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                         "IREE EP: Registering parameter provider");
-    VmModulePtr parameters_module;
-    iree_io_parameter_provider_t* provider_raw = parameter_provider.Get();
-    IREE_ORT_RETURN_IF_ERROR(iree_io_parameters_module_create(
-        iree_runtime_instance_vm_instance(ep->factory_.IreeInstance()), 1,
-        &provider_raw,
+  RuntimeSessionPtr shared_session;
+  {
+    iree_runtime_session_options_t session_opts;
+    iree_runtime_session_options_initialize(&session_opts);
+    IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_create_with_device(
+        ep->factory_.IreeInstance(), &session_opts, ep->IreeDevice(),
         iree_runtime_instance_host_allocator(ep->factory_.IreeInstance()),
-        parameters_module.ForOutput()));
-    IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_append_module(
-        session.Get(), parameters_module.Get()));
+        shared_session.ForOutput()));
+
+    if (parameter_provider) {
+      VmModulePtr parameters_module;
+      iree_io_parameter_provider_t* provider_raw = parameter_provider.Get();
+      IREE_ORT_RETURN_IF_ERROR(iree_io_parameters_module_create(
+          iree_runtime_instance_vm_instance(ep->factory_.IreeInstance()), 1,
+          &provider_raw,
+          iree_runtime_instance_host_allocator(ep->factory_.IreeInstance()),
+          parameters_module.ForOutput()));
+      IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_append_module(
+          shared_session.Get(), parameters_module.Get()));
+    }
+
+    IREE_ORT_RETURN_IF_ERROR(
+        iree_runtime_session_append_bytecode_module_from_file(
+            shared_session.Get(), vmfb_file.Path().c_str()));
   }
 
-  // Phase 5: Load VMFB bytecode module.
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Loading VMFB module");
-  IREE_ORT_RETURN_IF_ERROR(
-      iree_runtime_session_append_bytecode_module_from_file(
-          session.Get(), vmfb_file.Path().c_str()));
+  std::vector<IreeNodeComputeInfo::Variant> variants;
 
-  // Phase 6: Lookup the main function.
-  // Function name format: "module.{graph_name}" (defaults to "main" if empty).
-  std::string graph_name = graph.GetName();
-  std::string function_name =
-      "module." + (graph_name.empty() ? std::string("main") : graph_name);
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Looking up function");
+  if (num_specialized == 0) {
+    // No specialization: single generic function.
+    iree_vm_function_t function;
+    IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
+        shared_session.Get(), iree_make_cstring_view(base_name.c_str()),
+        &function));
+    variants.push_back({function, DimSpecVariant{}});
+  } else {
+    // Lookup specialized variant functions.
+    variants.reserve(num_specialized + 1);
+    for (size_t i = 0; i < num_specialized; ++i) {
+      std::string func_name = base_name + "_variant" + std::to_string(i);
+      iree_vm_function_t function;
+      IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
+          shared_session.Get(), iree_make_cstring_view(func_name.c_str()),
+          &function));
 
-  iree_vm_function_t function;
-  IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
-      session.Get(), iree_make_cstring_view(function_name.c_str()), &function));
+      size_t variant_idx = sorted_indices[i];
+      variants.push_back({function, dim_spec_variants[variant_idx]});
+    }
+    // Lookup generic fallback function (empty specs = always matches).
+    {
+      std::string func_name = base_name + "_generic";
+      iree_vm_function_t function;
+      IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
+          shared_session.Get(), iree_make_cstring_view(func_name.c_str()),
+          &function));
+      variants.push_back({function, DimSpecVariant{}});
+    }
+  }
 
-  // Create NodeComputeInfo with session and function (transfers ownership).
-  auto* info = new IreeNodeComputeInfo(*ep, std::move(session), function);
+  // Build symbolic dimension mappings for runtime dispatch.
+  auto dim_mappings = BuildSymbolicDimMappings(graph);
+
+  auto* info =
+      new IreeNodeComputeInfo(*ep, std::move(shared_session),
+                              std::move(variants), std::move(dim_mappings));
   node_compute_infos[0] = info;
 
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Compilation complete");
+  ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                        "IREE EP: Compilation complete (%zu variants)",
+                        variants.size());
   return nullptr;
 }
 
@@ -262,10 +466,13 @@ void ORT_API_CALL IreeEp::ReleaseNodeComputeInfosImpl(
 // IreeNodeComputeInfo Implementation
 // ============================================================================
 
-IreeNodeComputeInfo::IreeNodeComputeInfo(IreeEp& ep_ref,
-                                         RuntimeSessionPtr session,
-                                         iree_vm_function_t function)
-    : ep(ep_ref), session_(std::move(session)), function_(function) {
+IreeNodeComputeInfo::IreeNodeComputeInfo(
+    IreeEp& ep_ref, RuntimeSessionPtr session, std::vector<Variant> variants,
+    std::vector<SymbolicDimMapping> dim_mappings)
+    : ep(ep_ref),
+      session_(std::move(session)),
+      variants_(std::move(variants)),
+      dim_mappings_(std::move(dim_mappings)) {
   ort_version_supported = ORT_API_VERSION;
   CreateState = CreateStateImpl;
   Compute = ComputeImpl;
@@ -275,8 +482,8 @@ IreeNodeComputeInfo::IreeNodeComputeInfo(IreeEp& ep_ref,
 IreeNodeComputeInfo::~IreeNodeComputeInfo() {
   // Note: Avoid using logger during cleanup - ORT logging infrastructure may
   // be torn down before our destructors run during Python interpreter shutdown.
-  // Explicitly release session to ensure proper cleanup ordering.
-  session_.Reset();
+  // Explicitly release sessions to ensure proper cleanup ordering.
+  variants_.clear();
 }
 
 /*static*/
@@ -295,6 +502,58 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     OrtKernelContext* kernel_context) noexcept {
   auto* info = static_cast<IreeNodeComputeInfo*>(this_ptr);
   Ort::KernelContext ctx(kernel_context);
+
+  // --- Runtime variant dispatch ---
+  // Build actual dim values from input shapes using the symbolic dim mappings.
+  std::unordered_map<std::string, int64_t> dim_values;
+  for (const auto& m : info->dim_mappings_) {
+    if (m.input_index < ctx.GetInputCount()) {
+      auto shape =
+          ctx.GetInput(m.input_index).GetTensorTypeAndShapeInfo().GetShape();
+      if (m.dim_index < shape.size()) {
+        dim_values[m.symbolic_name] = shape[m.dim_index];
+      }
+    }
+  }
+
+  // Select best matching variant (iterate most specific to least).
+  // The generic fallback is always last and always matches.
+  const Variant* selected = nullptr;
+  for (const auto& v : info->variants_) {
+    bool match = true;
+    for (const auto& spec : v.dim_specs) {
+      auto it = dim_values.find(spec.symbolic_name);
+      if (it == dim_values.end()) continue;
+      if (spec.kind == DimSpec::Kind::kStatic && it->second != spec.value) {
+        match = false;
+        break;
+      }
+      if (spec.kind == DimSpec::Kind::kDivisibleBy &&
+          it->second % spec.value != 0) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      selected = &v;
+      break;
+    }
+  }
+  if (!selected) {
+    // Build a message showing what dims didn't match.
+    std::string dim_info;
+    for (const auto& [name, val] : dim_values) {
+      if (!dim_info.empty()) dim_info += ", ";
+      dim_info += name + "=" + std::to_string(val);
+    }
+    return Ort::Status(
+               std::format("IREE EP: No variant matches input dimensions: {}. "
+                           "Add a matching dim_spec or a generic fallback.",
+                           dim_info)
+                   .c_str(),
+               ORT_FAIL)
+        .release();
+  }
 
   iree_hal_device_t* device = info->ep.IreeDevice();
   iree_hal_allocator_t* allocator =
@@ -317,7 +576,7 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   // Initialize the call.
   RuntimeCall call;
   IREE_ORT_RETURN_IF_ERROR(iree_runtime_call_initialize(
-      info->session_.Get(), info->function_, call.Get()));
+      info->session_.Get(), selected->function, call.Get()));
   call.MarkInitialized();
 
   // Push input buffer views.

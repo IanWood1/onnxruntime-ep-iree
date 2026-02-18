@@ -14,13 +14,31 @@
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "iree_ep_factory.h"
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
 namespace onnxruntime::iree {
+
+// A single dimension constraint for specialization.
+struct DimSpec {
+  enum class Kind { kStatic, kDivisibleBy };
+  std::string symbolic_name;
+  Kind kind;
+  int64_t value;  // Concrete value (kStatic) or divisor (kDivisibleBy).
+};
+
+// A set of dimension constraints forming one specialization variant.
+using DimSpecVariant = std::vector<DimSpec>;
+
+// Parses the JSON string from the "ep.iree.dim_specs" session option.
+// Format: '[{"sym_name": 1, "sym_name2": "%16"}, ...]'
+// Returns a vector of variants (one per JSON object).
+std::vector<DimSpecVariant> ParseDimSpecsJson(const std::string& json);
 
 // Forward declarations
 class IreeEpFactory;
@@ -42,6 +60,8 @@ class IreeEp : public OrtEp, public ApiPtrs {
     std::string backend = "";
     // Save intermediate compilation artifacts (MLIR, VMFB) for debugging.
     bool save_intermediates = false;
+    // Parsed dim spec variants from "ep.iree.dim_specs" session option.
+    std::vector<DimSpecVariant> dim_spec_variants;
   };
 
   IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,
@@ -90,12 +110,26 @@ class IreeEp : public OrtEp, public ApiPtrs {
 };
 
 // Compute kernel for compiled nodes.
-// Holds the IREE session and function for a compiled subgraph.
+// Holds one or more IREE sessions/functions for compiled subgraph variants.
+// At runtime, dispatches to the most specific matching variant.
 struct IreeNodeComputeInfo : OrtNodeComputeInfo {
-  // Constructor takes ownership of session and stores function reference.
-  // Session is created in CompileImpl and passed here.
+  // A single compiled variant (specialized or generic).
+  struct Variant {
+    iree_vm_function_t function;
+    DimSpecVariant dim_specs;  // Empty for the generic fallback.
+  };
+
+  // Maps a symbolic dimension name to a specific (input, dim) position so we
+  // can read actual values at runtime for dispatch.
+  struct SymbolicDimMapping {
+    size_t input_index;
+    size_t dim_index;
+    std::string symbolic_name;
+  };
+
   IreeNodeComputeInfo(IreeEp& ep, RuntimeSessionPtr session,
-                      iree_vm_function_t function);
+                      std::vector<Variant> variants,
+                      std::vector<SymbolicDimMapping> dim_mappings);
 
   ~IreeNodeComputeInfo();
 
@@ -116,9 +150,14 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   // Non-owning reference to parent EP. The EP must outlive this compute info.
   IreeEp& ep;
 
-  // IREE runtime state for this compiled subgraph.
+  // Shared session owning the parameters module and all variant VMFBs.
   RuntimeSessionPtr session_;
-  iree_vm_function_t function_;
+
+  // Variants sorted by specificity (most specific first, generic last).
+  std::vector<Variant> variants_;
+
+  // Mappings from symbolic names to input tensor positions for dispatch.
+  std::vector<SymbolicDimMapping> dim_mappings_;
 };
 
 }  // namespace onnxruntime::iree

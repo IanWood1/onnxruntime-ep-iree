@@ -354,6 +354,12 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
         sess_opts.GetConfigEntryOrDefault("ep.iree.opt_level", "O0");
     config.save_intermediates = sess_opts.GetConfigEntryOrDefault(
                                     "ep.iree.save_intermediates", "0") == "1";
+
+    std::string dim_specs_str =
+        sess_opts.GetConfigEntryOrDefault("ep.iree.dim_specs", "");
+    if (!dim_specs_str.empty()) {
+      config.dim_spec_variants = ParseDimSpecsJson(dim_specs_str);
+    }
   }
 
   // Select backend based on driver.

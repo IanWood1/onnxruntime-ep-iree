@@ -24,22 +24,46 @@
 #define ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
 
 #include <string>
+#include <vector>
 
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
 namespace onnxruntime::iree {
 
+struct DimSpec;
+using DimSpecVariant = std::vector<DimSpec>;
+
 // Generates MLIR text from an OrtGraph and writes it to the specified file.
 // Small initializers are inlined in the MLIR. Large initializers are emitted as
 // parameter references and their data is written to an IRPA archive at
 // irpa_path. out_index and out_provider are populated with the parameter index
 // and provider for the archive. They remain null if no parameters are needed.
+//
+// dim_specs controls dimension specialization:
+// - kStatic specs replace dynamic dims with concrete values in the function
+//   signature (inputs, outputs, return).
+// - kDivisibleBy specs emit torch.symbolic_int + torch.bind_symbolic_shape ops
+//   at the start of the function body.
+// Pass an empty vector for the generic (unspecialized) variant.
 OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
                         const std::string& mlir_path,
                         const std::string& irpa_path,
+                        const DimSpecVariant& dim_specs,
                         ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider);
+                        ParameterProviderPtr& out_provider,
+                        bool build_irpa = true,
+                        const std::string& function_name_suffix = "");
+
+// Generates a single MLIR module with multiple functions (one per variant).
+// All functions share the same module so compiled weights are shared in the
+// VMFB. Each pair is (function_name_suffix, dim_specs). The IRPA archive is
+// built once.
+OrtStatus* GenerateMultiVariantMlir(
+    const Ort::ConstGraph& graph, const OrtApi& ort_api,
+    const std::string& mlir_path, const std::string& irpa_path,
+    const std::vector<std::pair<std::string, DimSpecVariant>>& variants,
+    ParameterIndexPtr& out_index, ParameterProviderPtr& out_provider);
 
 }  // namespace onnxruntime::iree
 
