@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir_gen.h"
+#include "mlir/mlir_gen.h"
 
 #include <cassert>
 #include <cstdint>
@@ -28,7 +28,7 @@
 #include "iree/io/formats/irpa/irpa_builder.h"
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_index_provider.h"
-#include "iree_ort_utils.h"
+#include "runtime/iree_ort_utils.h"
 
 namespace onnxruntime::iree {
 namespace {

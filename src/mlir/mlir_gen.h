@@ -20,13 +20,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
-#define ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_MLIR_MLIR_GEN_H_
+#define ONNXRUNTIME_EP_IREE_SRC_MLIR_MLIR_GEN_H_
 
 #include <string>
 
-#include "iree_wrappers.h"
-#include "ort_import.h"
+#include "utils/iree_wrappers.h"
+#include "utils/ort_import.h"
 
 namespace onnxruntime::iree {
 
@@ -43,4 +43,4 @@ OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
 
 }  // namespace onnxruntime::iree
 
-#endif  // ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_MLIR_MLIR_GEN_H_

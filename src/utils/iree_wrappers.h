@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_
-#define ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_UTILS_IREE_WRAPPERS_H_
+#define ONNXRUNTIME_EP_IREE_SRC_UTILS_IREE_WRAPPERS_H_
 
 #include <string>
 
@@ -19,7 +19,7 @@
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_provider.h"
 #include "iree/runtime/api.h"
-#include "ort_import.h"
+#include "utils/ort_import.h"
 
 namespace onnxruntime::iree {
 
@@ -258,4 +258,4 @@ inline OrtStatus* IreeStatusToOrtStatus(iree_status_t status) {
 
 }  // namespace onnxruntime::iree
 
-#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_UTILS_IREE_WRAPPERS_H_

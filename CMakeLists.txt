@@ -131,20 +131,35 @@ else()
   endif()
 endif()
 
-# Build shared library (EP plugin)
+# Common compile options for all EP targets.
+if(MSVC)
+  set(IREE_EP_COMPILE_OPTIONS /W3)
+  set(IREE_EP_COMPILE_DEFINITIONS _CRT_SECURE_NO_WARNINGS)
+else()
+  set(IREE_EP_COMPILE_OPTIONS
+    -Wall -Wextra -Werror
+    $<$<CONFIG:Debug>:-g -O0>
+    $<$<CONFIG:Release>:-O3>
+  )
+endif()
+
+# Ensure all OBJECT library sources are compiled with -fPIC.
+# CMake only auto-enables PIC for SHARED library sources; OBJECT libraries
+# consumed via $<TARGET_OBJECTS:...> do not inherit this property.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Build subdirectory object libraries.
+add_subdirectory(src)
+
+# Link object libraries into shared library (EP plugin).
 add_library(onnxruntime_ep_iree SHARED
-  src/plugin_entry.cc
-  src/iree_ep_factory.cc
-  src/iree_ep.cc
-  src/iree_compile.cc
-  src/mlir_gen.cc
-  src/iree_ort_utils.cc
-  src/iree_allocator.cc
-  src/iree_data_transfer.cc
-  src/temp_file.cc
+  $<TARGET_OBJECTS:iree_ep_core>
+  $<TARGET_OBJECTS:iree_ep_mlir>
+  $<TARGET_OBJECTS:iree_ep_runtime>
+  $<TARGET_OBJECTS:iree_ep_utils>
 )
 
-# Statically link IREE runtime and io/parameter libraries.
+# Link IREE runtime and io/parameter libraries.
 target_link_libraries(onnxruntime_ep_iree PRIVATE
   iree_runtime_unified
   iree_io_parameter_index
@@ -153,42 +168,16 @@ target_link_libraries(onnxruntime_ep_iree PRIVATE
   iree_modules_io_parameters_parameters
 )
 
-
-# Include directories
-target_include_directories(onnxruntime_ep_iree PRIVATE
-  ${IREE_EP_ONNX_SRC_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-# Compiler flags
-if(MSVC)
-  target_compile_options(onnxruntime_ep_iree PRIVATE /W3)
-  target_compile_definitions(onnxruntime_ep_iree PRIVATE
-    _CRT_SECURE_NO_WARNINGS
-  )
-else()
-  target_compile_options(onnxruntime_ep_iree PRIVATE
-    -Wall
-    -Wextra
-    -Werror
-    $<$<CONFIG:Debug>:-g -O0>
-    $<$<CONFIG:Release>:-O3>
-  )
-endif()
-
 # Export symbols for plugin loading
 if(MSVC)
-  # Windows: Use .def file (ORT_EXPORT is defined as empty in ORT headers on Windows)
   set_target_properties(onnxruntime_ep_iree PROPERTIES
     LINK_FLAGS "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.def"
   )
 elseif(UNIX AND NOT APPLE)
-  # Linux: Use version script
   set_target_properties(onnxruntime_ep_iree PROPERTIES
     LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.lds"
   )
 elseif(APPLE)
-  # macOS: Export all symbols
   set_target_properties(onnxruntime_ep_iree PROPERTIES
     LINK_FLAGS "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.txt"
   )

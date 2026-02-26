@@ -10,10 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree_data_transfer.h"
+#include "core/iree_data_transfer.h"
 
 #include "iree/hal/buffer_transfer.h"
-#include "iree_ort_utils.h"
+#include "runtime/iree_ort_utils.h"
 
 namespace onnxruntime::iree {
 

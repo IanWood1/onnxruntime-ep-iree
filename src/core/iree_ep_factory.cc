@@ -10,15 +10,15 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree_ep_factory.h"
+#include "core/iree_ep_factory.h"
 
 #include <algorithm>
 #include <memory>
 #include <mutex>
 
-#include "iree_allocator.h"
-#include "iree_data_transfer.h"
-#include "iree_ep.h"
+#include "core/iree_allocator.h"
+#include "core/iree_data_transfer.h"
+#include "core/iree_ep.h"
 
 namespace onnxruntime::iree {
 

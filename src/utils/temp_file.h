@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNXRUNTIME_EP_IREE_SRC_TEMP_FILE_H_
-#define ONNXRUNTIME_EP_IREE_SRC_TEMP_FILE_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_UTILS_TEMP_FILE_H_
+#define ONNXRUNTIME_EP_IREE_SRC_UTILS_TEMP_FILE_H_
 
 #include <string>
 #include <string_view>
@@ -47,4 +47,4 @@ class TempFile {
 
 }  // namespace onnxruntime::iree
 
-#endif  // ONNXRUNTIME_EP_IREE_SRC_TEMP_FILE_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_UTILS_TEMP_FILE_H_

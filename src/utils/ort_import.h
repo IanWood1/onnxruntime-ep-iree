@@ -12,8 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNXRUNTIME_EP_IREE_SRC_ORT_IMPORT_H_
-#define ONNXRUNTIME_EP_IREE_SRC_ORT_IMPORT_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_UTILS_ORT_IMPORT_H_
+#define ONNXRUNTIME_EP_IREE_SRC_UTILS_ORT_IMPORT_H_
 
 // ORT_API_MANUAL_INIT prevents static initialization of the C++ API.
 // We must call Ort::InitApi() explicitly before using any C++ API wrappers.
@@ -31,4 +31,4 @@
     }                                \
   } while (0)
 
-#endif  // ONNXRUNTIME_EP_IREE_SRC_ORT_IMPORT_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_UTILS_ORT_IMPORT_H_

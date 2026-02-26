@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree_ep_factory.h"
-#include "ort_import.h"
+#include "core/iree_ep_factory.h"
+#include "utils/ort_import.h"
 
 extern "C" {
 

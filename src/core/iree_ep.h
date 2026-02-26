@@ -11,16 +11,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
-#define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_CORE_IREE_EP_H_
+#define ONNXRUNTIME_EP_IREE_SRC_CORE_IREE_EP_H_
 
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include "iree_ep_factory.h"
-#include "iree_wrappers.h"
-#include "ort_import.h"
+#include "core/iree_ep_factory.h"
+#include "utils/iree_wrappers.h"
+#include "utils/ort_import.h"
 
 namespace onnxruntime::iree {
 
@@ -156,4 +156,4 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
 
 }  // namespace onnxruntime::iree
 
-#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_CORE_IREE_EP_H_

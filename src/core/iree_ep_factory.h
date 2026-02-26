@@ -8,8 +8,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_FACTORY_H_
-#define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_FACTORY_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_CORE_IREE_EP_FACTORY_H_
+#define ONNXRUNTIME_EP_IREE_SRC_CORE_IREE_EP_FACTORY_H_
 
 #include <memory>
 #include <mutex>
@@ -17,34 +17,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include "iree_wrappers.h"
-#include "ort_import.h"
+#include "utils/ep_defs.h"
+#include "utils/iree_wrappers.h"
+#include "utils/ort_import.h"
 
 namespace onnxruntime::iree {
 
 // Forward declarations.
 class IreeAllocator;
 class IreeDataTransfer;
-
-// EP configuration constants
-inline constexpr const char* kEpVendor = "IREE";
-inline constexpr uint32_t kEpVendorId = 0x1EEE;  // "IREE" in hex-ish
-inline constexpr const char* kEpVersion = "0.1.0";
-
-// Hardware vendor IDs for device matching.
-// These match OrtDevice::VendorIds from onnxruntime/core/framework/ortdevice.h.
-namespace VendorIds {
-inline constexpr uint32_t kAmd = 0x1002;     // AMD: ROCm, MIGraphX EPs
-inline constexpr uint32_t kNvidia = 0x10DE;  // NVIDIA: CUDA/TensorRT
-inline constexpr uint32_t kIntel = 0x8086;   // Intel: OpenVINO
-}  // namespace VendorIds
-
-// Helper struct to pass API pointers
-struct ApiPtrs {
-  const OrtApi& ort_api;
-  const OrtEpApi& ep_api;
-  const OrtModelEditorApi& model_editor_api;
-};
 
 // IREE Execution Provider Factory
 // Inherits from OrtEpFactory and sets up function pointers in constructor.
@@ -149,4 +130,4 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
 
 }  // namespace onnxruntime::iree
 
-#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_EP_FACTORY_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_CORE_IREE_EP_FACTORY_H_

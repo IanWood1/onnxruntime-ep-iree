@@ -11,18 +11,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree_ep.h"
+#include "core/iree_ep.h"
 
 #include <fstream>
 #include <vector>
 
+#include "core/iree_ep_factory.h"
 #include "iree/modules/io/parameters/module.h"
 #include "iree/runtime/api.h"
-#include "iree_compile.h"
-#include "iree_ep_factory.h"
-#include "iree_ort_utils.h"
-#include "mlir_gen.h"
-#include "temp_file.h"
+#include "mlir/iree_compile.h"
+#include "mlir/mlir_gen.h"
+#include "runtime/iree_ort_utils.h"
+#include "utils/temp_file.h"
 
 namespace onnxruntime::iree {
 

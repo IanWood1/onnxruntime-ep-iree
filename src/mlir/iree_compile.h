@@ -11,12 +11,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_
-#define ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_MLIR_IREE_COMPILE_H_
+#define ONNXRUNTIME_EP_IREE_SRC_MLIR_IREE_COMPILE_H_
 
 #include <string>
 
-#include "ort_import.h"
+#include "utils/ort_import.h"
 
 namespace onnxruntime::iree {
 
@@ -38,4 +38,4 @@ OrtStatus* CompileToVmfb(const std::string& mlir_path,
 
 }  // namespace onnxruntime::iree
 
-#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_MLIR_IREE_COMPILE_H_

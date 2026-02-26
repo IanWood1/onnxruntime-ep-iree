@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree_allocator.h"
+#include "core/iree_allocator.h"
 
 #include <mutex>
 

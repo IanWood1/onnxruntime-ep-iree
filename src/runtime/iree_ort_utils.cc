@@ -10,13 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree_ort_utils.h"
+#include "runtime/iree_ort_utils.h"
 
 #include <numeric>
 
 #include "iree/hal/buffer_transfer.h"
 #include "iree/hal/buffer_view_util.h"
-#include "iree_ep_factory.h"
+#include "utils/ep_defs.h"
 
 namespace onnxruntime::iree {
 

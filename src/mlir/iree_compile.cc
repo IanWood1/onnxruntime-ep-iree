@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "iree_compile.h"
+#include "mlir/iree_compile.h"
 
 #include <cstdlib>
 #include <format>
